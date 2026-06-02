@@ -1,6 +1,12 @@
 hipporag2/*
 .idea/*
 
+# Ignore virtual environments
+hipporag_env/
+venv/
+.venv/
+env/
+
 # Ignore test files
 test_example.py
 test_example.ipynb
@@ -21,3 +27,7 @@ data/
 clear_outputs_and_logs.sh
 # Ignore the env file
 .env
+
+# Ignore Claude Code internal files
+CLAUDE.md
+SKILLS.md
