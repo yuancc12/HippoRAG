@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <h1 align="center">HippoRAG 2: From RAG to Memory</h1>
 <p align="center">
     <img src="https://github.com/OSU-NLP-Group/HippoRAG/raw/main/images/hippo_brain.png" width="55%" style="max-width: 300px;">
