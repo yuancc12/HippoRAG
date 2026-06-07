@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -191,6 +192,9 @@ class HippoRAG:
         """
         self._graph_pickle_filename = os.path.join(
             self.working_dir, f"graph.pickle"
+        )
+        self._synonymy_edges_pickle_filename = os.path.join(
+            self.working_dir, f"synonymy_edges.pickle"
         )
 
         preloaded_graph = None
@@ -736,6 +740,140 @@ class HippoRAG:
 
         return queries_solutions, all_response_message, all_metadata
 
+    def ircot_qa(self,
+                 queries: List[str],
+                 gold_docs: List[List[str]] = None,
+                 gold_answers: List[List[str]] = None,
+                 checkpoint_path: str = None,
+                 checkpoint_every: int = 50):
+        """
+        IRCoT: Interleaved Retrieval and Chain-of-Thought reasoning.
+        For each query, alternates between HippoRAG retrieval and LLM thought generation
+        for up to max_qa_steps steps, then extracts the final answer.
+        Supports checkpointing: saves progress every checkpoint_every queries.
+        """
+        if gold_answers is not None:
+            qa_em_evaluator = QAExactMatch(global_config=self.global_config)
+            qa_f1_evaluator = QAF1Score(global_config=self.global_config)
+
+        if gold_docs is not None:
+            retrieval_recall_evaluator = RetrievalRecall(global_config=self.global_config)
+
+        if not self.ready_to_retrieve:
+            self.prepare_retrieval_objects()
+
+        dataset = self.global_config.dataset or 'hotpotqa'
+        ircot_template = f'ircot_{dataset}'
+        if not self.prompt_template_manager.is_template_name_valid(ircot_template):
+            logger.warning(f"No IRCoT template for '{dataset}', falling back to ircot_hotpotqa.")
+            ircot_template = 'ircot_hotpotqa'
+
+        # Load checkpoint if exists
+        completed = {}
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                completed = {item['question']: item for item in json.load(f)}
+            logger.info(f"Resuming from checkpoint: {len(completed)} queries already done.")
+
+        queries_solutions = []
+        all_final_docs = []
+
+        for q_idx, query in enumerate(tqdm(queries, desc="IRCoT")):
+            # Resume: skip already completed queries
+            if query in completed:
+                item = completed[query]
+                qs = QuerySolution(question=query, docs=item['docs'], answer=item['answer'])
+                if gold_answers is not None:
+                    qs.gold_answers = list(gold_answers[q_idx])
+                if gold_docs is not None:
+                    qs.gold_docs = gold_docs[q_idx]
+                queries_solutions.append(qs)
+                all_final_docs.append(item['docs'])
+                continue
+
+            thoughts = []
+            accumulated_docs = []
+            seen_docs = set()
+
+            for step in range(self.global_config.max_qa_steps):
+                retrieval_query = query + ' ' + ' '.join(thoughts) if thoughts else query
+
+                step_results = self.retrieve(queries=[retrieval_query])
+                for doc in step_results[0].docs[:self.global_config.qa_top_k]:
+                    if doc not in seen_docs:
+                        accumulated_docs.append(doc)
+                        seen_docs.add(doc)
+
+                prompt_user = ''
+                for doc in accumulated_docs:
+                    prompt_user += f'Wikipedia Title: {doc}\n\n'
+                prompt_user += f'Question: {query}\nThought: ' + ' '.join(thoughts)
+
+                messages = self.prompt_template_manager.render(name=ircot_template, prompt_user=prompt_user)
+
+                try:
+                    response_str, _, _ = self.llm_model.infer(messages)
+                    thought = response_str.strip()
+                except Exception as e:
+                    logger.warning(f"IRCoT step {step} LLM call failed: {e}")
+                    thought = ''
+
+                thoughts.append(thought)
+                if 'So the answer is:' in thought:
+                    break
+
+            final_thought = thoughts[-1] if thoughts else ''
+            if 'So the answer is:' in final_thought:
+                answer = final_thought.split('So the answer is:')[-1].strip().rstrip('.')
+            else:
+                answer = final_thought
+
+            qs = QuerySolution(question=query, docs=accumulated_docs, answer=answer)
+            if gold_answers is not None:
+                qs.gold_answers = list(gold_answers[q_idx])
+            if gold_docs is not None:
+                qs.gold_docs = gold_docs[q_idx]
+            queries_solutions.append(qs)
+            all_final_docs.append(accumulated_docs)
+
+            # Save checkpoint
+            completed[query] = {'question': query, 'answer': answer, 'docs': accumulated_docs}
+            if checkpoint_path and (len(completed) % checkpoint_every == 0):
+                with open(checkpoint_path, 'w', encoding='utf-8') as f:
+                    json.dump(list(completed.values()), f, ensure_ascii=False)
+                logger.info(f"Checkpoint saved: {len(completed)} queries done.")
+
+        overall_retrieval_result = None
+        if gold_docs is not None:
+            k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
+            overall_retrieval_result, _ = retrieval_recall_evaluator.calculate_metric_scores(
+                gold_docs=gold_docs, retrieved_docs=all_final_docs, k_list=k_list)
+            logger.info(f"IRCoT Retrieval results: {overall_retrieval_result}")
+
+        if gold_answers is not None:
+            overall_qa_em_result, _ = qa_em_evaluator.calculate_metric_scores(
+                gold_answers=gold_answers,
+                predicted_answers=[qs.answer for qs in queries_solutions],
+                aggregation_fn=np.max)
+            overall_qa_f1_result, _ = qa_f1_evaluator.calculate_metric_scores(
+                gold_answers=gold_answers,
+                predicted_answers=[qs.answer for qs in queries_solutions],
+                aggregation_fn=np.max)
+            overall_qa_em_result.update(overall_qa_f1_result)
+            overall_qa_results = {k: round(float(v), 4) for k, v in overall_qa_em_result.items()}
+            logger.info(f"IRCoT QA results: {overall_qa_results}")
+
+            for idx, qs in enumerate(queries_solutions):
+                qs.gold_answers = list(gold_answers[idx])
+                if gold_docs is not None:
+                    qs.gold_docs = gold_docs[idx]
+
+            all_response_message = [qs.answer for qs in queries_solutions]
+            all_metadata = [{} for _ in queries_solutions]
+            return queries_solutions, all_response_message, all_metadata, overall_retrieval_result, overall_qa_results
+
+        return queries_solutions, [qs.answer for qs in queries_solutions], [{} for _ in queries_solutions]
+
     def add_fact_edges(self, chunk_ids: List[str], chunk_triples: List[Tuple]):
         """
         Adds fact edges from given triples to the graph.
@@ -850,6 +988,20 @@ class HippoRAG:
         self.entity_id_to_row = self.entity_embedding_store.get_all_id_to_rows()
         entity_node_keys = list(self.entity_id_to_row.keys())
 
+        # The KNN search below is the slowest part of graph construction (pure local
+        # computation, no LLM cost) and isn't checkpointed by save_igraph(), which only
+        # runs once the whole graph is built. Cache its output so an interrupted run can
+        # skip straight back to augment_graph() without redoing the KNN search.
+        if os.path.isfile(self._synonymy_edges_pickle_filename):
+            with open(self._synonymy_edges_pickle_filename, 'rb') as f:
+                cached_entity_count, cached_synonymy_edges = pickle.load(f)
+            if cached_entity_count == len(entity_node_keys):
+                logger.info(f"Loading {len(cached_synonymy_edges)} cached synonymy edges from {self._synonymy_edges_pickle_filename}")
+                self.node_to_node_stats.update(cached_synonymy_edges)
+                return
+            else:
+                logger.info(f"Cached synonymy edges are stale (entity count {cached_entity_count} != {len(entity_node_keys)}), recomputing.")
+
         logger.info(f"Performing KNN retrieval for each phrase nodes ({len(entity_node_keys)}).")
 
         entity_embs = self.entity_embedding_store.get_embeddings(entity_node_keys)
@@ -865,6 +1017,7 @@ class HippoRAG:
 
         num_synonym_triple = 0
         synonym_candidates = []  # [(node key, [(synonym node key, corresponding score), ...]), ...]
+        synonymy_edges = {}
 
         for node_key in tqdm(query_node_key2knn_node_keys.keys(), total=len(query_node_key2knn_node_keys)):
             synonyms = []
@@ -886,10 +1039,16 @@ class HippoRAG:
                         synonyms.append((nn, score))
                         num_synonym_triple += 1
 
-                        self.node_to_node_stats[sim_edge] = score  # Need to seriously discuss on this
+                        synonymy_edges[sim_edge] = score  # Need to seriously discuss on this
                         num_nns += 1
 
             synonym_candidates.append((node_key, synonyms))
+
+        self.node_to_node_stats.update(synonymy_edges)
+
+        with open(self._synonymy_edges_pickle_filename, 'wb') as f:
+            pickle.dump((len(entity_node_keys), synonymy_edges), f)
+        logger.info(f"Cached {len(synonymy_edges)} synonymy edges to {self._synonymy_edges_pickle_filename}")
 
     def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
         """

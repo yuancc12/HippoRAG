@@ -61,6 +61,10 @@ class BaseConfig:
         default=5,
         metadata={"help": "Max number of retry attempts for an asynchronous API calling."}
     )
+    llm_request_delay: float = field(
+        default=0.0,
+        metadata={"help": "Seconds to sleep after each non-cached LLM API call, to stay under the provider's rate limit and reduce HTTP 429 errors."}
+    )
     # Storage specific attributes
     force_openie_from_scratch: bool = field(
         default=False,

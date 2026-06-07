@@ -2,6 +2,9 @@ import os
 from typing import List
 import json
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from src.hipporag.HippoRAG import HippoRAG
 from src.hipporag.utils.misc_utils import string_to_bool
 from src.hipporag.utils.config_utils import BaseConfig
@@ -136,7 +139,23 @@ def main():
     hipporag.index(docs)
 
     # Retrieval and QA
-    hipporag.rag_qa(queries=all_queries, gold_docs=gold_docs, gold_answers=gold_answers)
+    results = hipporag.rag_qa(queries=all_queries, gold_docs=gold_docs, gold_answers=gold_answers)
+
+    # Save evaluation results to JSON
+    if results is not None and len(results) == 5:
+        import datetime
+        _, _, _, retrieval_result, qa_result = results
+        summary = {
+            "dataset": dataset_name,
+            "llm": llm_name,
+            "embedding": args.embedding_name,
+            "retrieval": retrieval_result,
+            "qa": qa_result,
+        }
+        result_path = os.path.join(save_dir, f"eval_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(result_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        logging.info(f"Results saved to {result_path}")
 
 if __name__ == "__main__":
     main()

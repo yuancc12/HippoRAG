@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from copy import deepcopy
 from typing import List, Tuple
 
@@ -12,7 +13,7 @@ from filelock import FileLock
 from openai import OpenAI
 from openai import AzureOpenAI
 from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
@@ -79,6 +80,11 @@ def cache_response(func):
         result = func(self, *args, **kwargs)
         message, metadata = result
 
+        # throttle real (non-cached) API calls to stay under the provider's rate limit
+        request_delay = getattr(self, "request_delay", 0.0)
+        if request_delay > 0:
+            time.sleep(request_delay)
+
         # insert new result into cache
         with FileLock(lock_file):
             conn = sqlite3.connect(self.cache_file_name)
@@ -104,8 +110,8 @@ def cache_response(func):
 def dynamic_retry_decorator(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
-        max_retries = getattr(self, "max_retries", 5)  
-        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))
+        max_retries = getattr(self, "max_retries", 5)
+        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_random_exponential(min=1, max=60))
         decorated_func = dynamic_retry(func)
         return decorated_func(self, *args, **kwargs)
     return wrapper
@@ -142,7 +148,8 @@ class CacheOpenAI(BaseLLM):
         else:
             client = None
 
-        self.max_retries = kwargs.get("max_retries", 2)
+        self.max_retries = kwargs.get("max_retries", getattr(global_config, "max_retry_attempts", 5))
+        self.request_delay = getattr(global_config, "llm_request_delay", 0.0)
 
         if self.global_config.azure_endpoint is None:
             self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
