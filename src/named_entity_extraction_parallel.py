@@ -4,7 +4,12 @@ from functools import partial
 sys.path.append('.')
 
 from src.processing import extract_json_dict
-from langchain_community.chat_models import ChatOllama, ChatLlamaCpp
+from langchain_community.chat_models import ChatOllama
+try:
+    from langchain_community.chat_models import ChatLlamaCpp
+except ImportError:
+    class ChatLlamaCpp:  # compatibility shim: not available in this langchain_community version, only used for local llama.cpp models
+        pass
 
 sys.path.append('.')
 import argparse
